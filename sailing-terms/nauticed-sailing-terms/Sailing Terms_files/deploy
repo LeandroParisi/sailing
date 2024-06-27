@@ -1,0 +1,528 @@
+class Uneeq {
+  // Gradually moving methods into this class rather than having everything in the global scope
+
+  constructor(options) {
+    this.options = options;
+    this.scrollTicking = false;
+    this.containedLayoutElem = null;
+    this.layoutTransitionInProgress;
+    this.layoutMode = null;
+    this.frameReady = false;
+    this.sessionLive = false;
+    this.sessionState = 'Initial';
+    this.sessionResumed = false;
+    this.addLoadHandler();
+  }
+
+  addLoadHandler() {
+    if ( this.options.initLoadHandler !== false ) {
+      window.addEventListener('load', () => {
+        this.init();
+      });
+    }
+  }
+
+  init() {
+    if ( this.validateOptions() ) {
+      this.uneeqAddFrame();
+      // Setup message event handler so we can get messages passed up from the iframe to the client's web page
+      if (window.addEventListener) {
+        window.addEventListener('message', (msg) => {
+          this.onMessage(msg);
+        }, false);
+      }
+    }
+  }
+
+  validateOptions() {
+    // Primarily all options validation is performed in Interactions App, though we perform
+    // some rudimentary validation on options that are used direction in this script, i.e. shareId.
+
+    // Validate Share Id
+    if ( !this.options || !this.isShareIdValidGuid(this.options.personaShareId) ) {
+      console.error('UneeQ Interactions experience could not be loaded: window.uneeqInteractionsOptions.personaShareId not valid.' +
+          ' Please add the following script to the head of your page:');
+      const codeHint = '<script>' + 'window.uneeqInteractionsOptions = { personaShareId: \'your-share-id\' }</script>';
+      console.error(codeHint);
+      return false;
+    }
+
+    // Validate Layout Mode
+    if ( !this.validateLayoutMode(this.options.layoutMode) ) {
+      return false;
+    }
+
+    // Validate Layout Mode Change Speed
+    this.validateLayoutModeChangeSpeedMs();
+
+    return true;
+  }
+
+  // Adds iFrame to load Hosted Experience
+  uneeqAddFrame() {
+    this.uneeqFrame = document.createElement('iframe');
+    this.uneeqFrame.id = 'uneeqFrame';
+    this.uneeqFrame.src = `https://interactions.us.uneeq.io/interactions/`;
+    const iFrameStyle = this.uneeqFrame.style;
+    iFrameStyle.position = 'fixed';
+    iFrameStyle.bottom = '0';
+
+    if (this.isMobileLayoutModeEnabled() ||
+    (this.options.layoutMode !== 'splitScreen' && this.options.position !== 'left')) {
+      // Only necessary for Overlay & splitScreen in left positions, or mobile
+      iFrameStyle.right = '0';
+    }
+
+    this.initScrollHandler();
+
+    iFrameStyle.width = '0px';
+    iFrameStyle.height = '0px';
+    iFrameStyle.zIndex = '99999';
+    iFrameStyle.border = 'none';
+    iFrameStyle.maxWidth = '100%';
+    this.uneeqFrame.sandbox = 'allow-scripts allow-same-origin allow-modals allow-top-navigation allow-popups ' +
+        'allow-presentation allow-popups-to-escape-sandbox allow-forms';
+    this.uneeqFrame.allow = 'camera;microphone;autoplay;';
+
+    // Get the client provided element to use for contained mode
+    this.containedLayoutElem = document.getElementById('uneeqContainedLayout');
+    if ( this.containedLayoutElem === null ) {
+      // Contained layout element was not provided by the customer.
+      // Create one for them and add it to the DOM.
+      this.containedLayoutElem = document.createElement('div');
+      this.containedLayoutElem.id = 'uneeqContainedLayout';
+      this.containedLayoutElem.style.width = 0;
+      this.containedLayoutElem.style.height = 0;
+      document.body.appendChild(this.containedLayoutElem);
+    }
+    this.containedLayoutElem.appendChild(this.uneeqFrame);
+
+    // Add view port tag if it doesn't exist - for mobile layout support
+    if ( document.querySelector('meta[name="viewport"]') === null ) {
+      const viewportTag = document.createElement('meta');
+      viewportTag.name = 'viewport';
+      viewportTag.content = 'width=device-width, initial-scale=1.0';
+      document.head.appendChild(viewportTag);
+    }
+  }
+
+  validateLayoutModeChangeSpeedMs() {
+    // Validate that layoutModeChangeSpeedMs is an integer, if not default to 600
+    if ( !Number.isInteger(this.options.layoutModeChangeSpeedMs) || this.options.layoutModeChangeSpeedMs < 0 ) {
+      if ( this.options.layoutModeChangeSpeedMs !== undefined ) {
+        console.warn('UneeQ: Warning: layoutModeChangeSpeedMs must be an integer value. Defaulting to 600.');
+      }
+      this.options.layoutModeChangeSpeedMs = 600;
+    }
+  }
+
+  // Validate is the supplied layoutMode, error if it's invalid and return false.
+  validateLayoutMode(layoutMode) {
+    if ( layoutMode !== 'fullScreen' && layoutMode !== 'splitScreen' && layoutMode !== 'overlay' && layoutMode !== 'contained' ) {
+      console.error('UneeQ: Error: provided layout mode is invalid: ', layoutMode);
+      return false;
+    }
+    return true;
+  }
+
+  postToFrame(type, value) {
+    if ( this.uneeqFrame ) {
+      this.uneeqFrame.contentWindow.postMessage({
+        type: type,
+        value: value,
+      }, '*');
+    }
+  }
+
+  getContainedLayoutElem() {
+    if ( this.containedLayoutElem === null ) {
+      this.containedLayoutElem = document.getElementById('uneeqContainedLayout');
+    }
+    return this.containedLayoutElem;
+  }
+
+  initScrollHandler() {
+    const checkIfSwitchLayoutMode = () => {
+      this.getContainedLayoutElem();
+
+      const containedElemBounds = this.containedLayoutElem.getBoundingClientRect();
+      const containedLayoutY = containedElemBounds.top;
+
+      // Divide by 4 to set the offset to be 1/4 (quarter) the height of the video element.
+      // This means when the top quarter of the video has been scrolled off screen, the layout will transition.
+      const offset = Math.floor(containedElemBounds.height / 4) * -1;
+
+      if ( this.layoutMode !== 'overlay' && (containedLayoutY) < offset ) {
+        uneeqSetLayoutMode('overlay');
+        this.layoutTransitionInProgress = true;
+      } else if ( containedLayoutY > offset && this.layoutMode === 'overlay' ) {
+        uneeqSetLayoutMode('contained');
+        this.layoutTransitionInProgress = true;
+      }
+    };
+
+    // containedAutoLayout defaults to false
+    const containedAutoLayout = this.options.containedAutoLayout !== undefined ? this.options.containedAutoLayout : false;
+
+    // Add the scroll handler if starting in contained mode and containedAutoLayout is enabled
+    if ( this.options.layoutMode === 'contained' && containedAutoLayout ) {
+      document.addEventListener( 'scroll', () => {
+        if (!this.scrollTicking) {
+          window.requestAnimationFrame(() => {
+            if ( this.sessionLive && !this.layoutTransitionInProgress ) {
+              checkIfSwitchLayoutMode();
+            }
+            this.scrollTicking = false;
+          });
+          this.scrollTicking = true;
+        }
+      });
+    }
+  }
+
+  /**
+ * Fade out the UneeQ Frame over 300ms, call fadedOutCallback, then fade back in over 300ms.
+ * When transitioning to overlay view, slide the frame down as it appears
+ * @param {function} fadedOutCallback Method that should be called when the UneeQ frame has completely faded out, before fading in.
+ * @param {string} layoutMode New layout mode that is being set.
+ */
+  frameFadeOutIn(fadedOutCallback, layoutMode) {
+    const layoutModeChangeSpeedMs = window.uneeqInteractionsOptions.layoutModeChangeSpeedMs || 600;
+    const transitionTimeMS = Math.floor(layoutModeChangeSpeedMs / 2);
+
+    this.uneeqFrame.style.transition = `opacity ${transitionTimeMS}ms ease-out`;
+    this.uneeqFrame.style.opacity = 0;
+
+    setTimeout( () => {
+      // When going to overlay mode fade set the frame to be positioned up 120px so it can slide down into view
+      if ( layoutMode === 'overlay' ) {
+        this.uneeqFrame.style.transition = 'none';
+        this.uneeqFrame.style.transform = `translate(0px,-120px)`;
+        this.uneeqFrame.style.opacity = 0;
+      }
+
+      // Wait a short time for the previous styles to be applied
+      setTimeout( () => {
+        this.uneeqFrame.style.transition = `transform ${transitionTimeMS}ms ease-out, opacity ${transitionTimeMS}ms ease-out`;
+        this.uneeqFrame.style.transform = `translate(0px,0px)`;
+        this.uneeqFrame.style.opacity = 1;
+      }, 50);
+
+      // The uneeqFrame has been faded out, call back now to perform the layout mode change
+      fadedOutCallback();
+    }, transitionTimeMS);
+  }
+
+  /**
+   * isMobileLayoutModeEnabled
+   * Initialised Mobile Layout if not configured
+   * Checks if client's pixels width is less than configured mobile width breakpoint
+   * @return {boolean}
+   */
+  isMobileLayoutModeEnabled() {
+    if (!this.options.mobileViewWidthBreakpoint) {
+      this.options.mobileViewWidthBreakpoint = 900;
+    }
+    return document.body.clientWidth <= this.options.mobileViewWidthBreakpoint;
+  }
+
+  /**
+   * handleClientResize
+   */
+  handleClientResize() {
+    if (this.frameReady) {
+      this.postToFrame('setMobileLayoutMode', this.isMobileLayoutModeEnabled());
+    }
+  }
+
+  /**
+   * Handler for when UneeQ frame is ready to process messages.
+   */
+  frameReadyHandler() {
+    this.frameReady = true;
+
+    // Pass up all uneeqInteractionsOptions
+    this.postToFrame('uneeqInteractionsOptions', this.options);
+
+    this.postToFrame('deployComplete', true);
+
+    this.initResizeHandler();
+    this.handleClientResize();
+
+    // Deprecated message
+    const uneeqEventMsg = new CustomEvent('uneeqEvent', {detail: {uneeqMessageType: 'Ready'}});
+    window.dispatchEvent(uneeqEventMsg);
+  }
+
+  initResizeHandler() {
+    this.isMobileLayoutModeEnabled();
+
+    let resizeTimeoutId = false; // holder for timeout id
+    const resizeDebounceMs = 250; // delay after event is "complete" to run callback
+
+    window.addEventListener('resize', () => {
+      // clear the timeout
+      clearTimeout(resizeTimeoutId);
+      // start timing for event "completion"
+      resizeTimeoutId = setTimeout(this.handleClientResize, resizeDebounceMs);
+    });
+  }
+
+  isShareIdValidGuid(personaShareId) {
+    const validShareId = RegExp(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/).test(personaShareId);
+    return validShareId;
+  }
+
+  /**
+   * -- Experimental Feature --
+   * Send a webrtc data channel message
+   * @param {message} message JSON object expected by pixel streaming to be passed to Jarvis
+   */
+  sendDataChannelMessage(message) {
+    console.warn('sendDataChannelMessage is an experimental feature. Functionality could change or be removed in future versions.');
+    this.postToFrame('sendDataChannelMessage', message);
+  }
+
+  /**
+   * @param {CustomEventInit<any>} eventDetail
+   */
+  sendEventMessage(eventDetail) {
+    const verboseLoggingEnabled =
+        (window.uneeqInteractionsOptions && window.uneeqInteractionsOptions.verboseLogging === undefined) ?
+            false : window.uneeqInteractionsOptions.verboseLogging;
+    if (verboseLoggingEnabled) {
+      console.debug('UneeQ Message: ', eventDetail);
+    }
+    const event = new CustomEvent('UneeqMessage', {detail: eventDetail});
+    window.dispatchEvent(event);
+  }
+
+  /**
+   * Handles events from the iFrame
+   * @param {event} event passed from the iFrame
+   */
+  onMessage(event) {
+    if ( !event || !event.data || !event.data.msg || !event.data.msg.uneeqMessageType ) {
+      // the message is not for UneeQ
+      return;
+    }
+
+    const uneeqMsg = event.data.msg;
+
+    switch (uneeqMsg.uneeqMessageType) {
+      case 'FrameReady':
+        this.frameReadyHandler();
+        break;
+
+      case 'ReadyToStart':
+        this.sendEventMessage({uneeqMessageType: 'ReadyToStart', timestamp: uneeqMsg.timestamp});
+        break;
+
+      case 'FrameResize':
+        this.uneeqFrame = document.getElementById('uneeqFrame');
+        Object.assign(this.uneeqFrame.style, uneeqMsg.style);
+
+        if (uneeqMsg.document) Object.assign(document.body.style, uneeqMsg.document.style);
+
+        if ( this.layoutMode !== uneeqMsg.layoutMode ) {
+          // layout mode has changed, sending LayoutModeUpdate message to client
+          this.sendEventMessage({
+            uneeqMessageType: 'LayoutModeUpdate',
+            layoutMode: uneeqMsg.layoutMode,
+            timestamp: uneeqMsg.timestamp,
+          });
+          this.layoutTransitionInProgress = false;
+        }
+        this.layoutMode = uneeqMsg.layoutMode;
+        break;
+
+      case 'SessionStateUpdate':
+        this.sessionLive = uneeqMsg.live;
+        this.sessionState = uneeqMsg.state;
+        this.sessionResumed = uneeqMsg.sessionResumed;
+        const uneeqLiveUpdateMessage = new CustomEvent('uneeqSessionStateUpdate',
+            {detail: {live: this.sessionLive, state: this.sessionState}} );
+        window.dispatchEvent(uneeqLiveUpdateMessage); // to be deprecated
+        this.sendEventMessage({
+          uneeqMessageType: 'SessionStateUpdate',
+          live: this.sessionLive,
+          state: this.sessionState,
+          sessionResumed: this.sessionResumed,
+          timestamp: uneeqMsg.timestamp,
+        });
+        break;
+
+      case 'SessionId':
+        const uneeqSessionIdMsg = new CustomEvent('uneeqSessionId', {detail: {uneeQSessionId: uneeqMsg.sessionId}});
+        window.dispatchEvent(uneeqSessionIdMsg); // to be deprecated
+        this.sendEventMessage(uneeqMsg);
+        break;
+
+      case 'Notification':
+        alert(uneeqMsg.msg);
+        break;
+
+      case 'WebRtcData':
+        // NO OP: consume message so it is not send through to parent page
+        break;
+
+      default:
+        const uneeqEventMsg = new CustomEvent('uneeqEvent', {detail: uneeqMsg});
+        window.dispatchEvent(uneeqEventMsg); // to be deprecated
+        this.sendEventMessage(uneeqMsg);
+        break;
+    }
+  }
+}
+
+const uneeq = new Uneeq(window.uneeqInteractionsOptions);
+
+const uneeqOnMessage = (msg) => {
+  uneeq.onMessage(msg);
+};
+
+/**
+ * Ask a question
+ * @param {question} question intent to be sent to the NLP
+ */
+function uneeqAsk(question) {
+  uneeq.postToFrame('askQuestion', question);
+}
+
+/**
+ * Enable the users microphone for audio recording
+ */
+function uneeqEnableMicrophone() {
+  uneeq.postToFrame('enableMicrophone', null);
+}
+
+/**
+ * End Session
+ */
+function uneeqEndSession() {
+  uneeq.postToFrame('endSession', null);
+}
+
+/**
+ * Hide the voice recording UI [deprecated]
+ */
+function uneeqHideVoiceInput() {
+  uneeqSetShowUserInputInterface(false);
+}
+
+/**
+ * Pause speech recognition processing
+ */
+function uneeqPauseSpeechRecognition() {
+  uneeq.postToFrame('pauseSpeechRecognition', null);
+}
+
+/**
+ * Resume speech recognition processing
+ */
+function uneeqResumeSpeechRecognition() {
+  uneeq.postToFrame('resumeSpeechRecognition', null);
+}
+
+/**
+ * Opens the Start Session Popup to allow a user to start a session
+ * @param {popupProperties} popupProperties
+ */
+function uneeqOpenStartSessionPopup(popupProperties) {
+  uneeq.postToFrame('openStartSessionPopup', popupProperties);
+}
+
+/**
+ * Sets the call to action text
+ * @param {callToActionText} callToActionText
+ */
+function uneeqSetCallToActionText(callToActionText) {
+  uneeq.postToFrame('setCallToActionText', callToActionText);
+}
+
+/**
+ * Sets the custom chat metadata
+ * @param {customMetadata} customMetadata
+ */
+function uneeqSetCustomChatMetadata(customMetadata) {
+  uneeq.postToFrame('setCustomChatMetadata', customMetadata);
+}
+
+/**
+ * Set the layout mode ( 'overlay' | 'splitScreen' | 'fullScreen' | 'contained' )
+ * @param {string} layoutMode
+ */
+function uneeqSetLayoutMode(layoutMode) {
+  if ( uneeq.validateLayoutMode(layoutMode) ) {
+    uneeq.frameFadeOutIn(() => {
+      uneeq.postToFrame('setLayoutMode', {layoutMode: layoutMode});
+    }, layoutMode);
+  }
+}
+
+/**
+ * Show or hide the closed captions
+ * @param {boolean} show
+ */
+function uneeqSetShowClosedCaptions(show) {
+  uneeq.postToFrame('setShowClosedCaptions', {show: show});
+}
+
+/**
+ * Show or hide the voice/text input interface
+ * @param {boolean} show
+ */
+function uneeqSetShowUserInputInterface(show) {
+  uneeq.postToFrame('setShowUserInputInterface', {show: show});
+}
+
+/**
+ * Show the voice recording UI [deprecated]
+ * @param {placeHolder} placeHolder for the input text box
+ */
+function uneeqShowVoiceInput(placeHolder) {
+  // TODO upon deprecation also remove setTextInputPlaceholder message handling from Interactions app.
+  if ( placeHolder !== null || placeHolder !== undefined ) {
+    uneeq.postToFrame('setTextInputPlaceholder', {placeholder: placeHolder});
+  }
+  uneeqSetShowUserInputInterface(true);
+}
+
+/**
+ * Start recording voice
+ */
+function uneeqStartRecording() {
+  uneeq.postToFrame('startRecording', null);
+}
+
+/**
+ * Start a session (must be used after user click/key event
+ */
+function uneeqStartSession() {
+  uneeq.postToFrame('startSession', null);
+}
+
+/**
+ * Stop recording voice
+ */
+function uneeqStopRecording() {
+  uneeq.postToFrame('stopRecording', null);
+}
+
+/**
+ * Stop Speaking
+ */
+function uneeqStopSpeaking() {
+  uneeq.postToFrame('stopSpeaking', null);
+}
+
+/**
+ * Unmute a digital human that is muted
+ */
+function uneeqUnmuteDigitalHuman() {
+  uneeq.postToFrame('unmuteDigitalHuman', null);
+}
+
+function uneeqUpdateDisplayContent(htmlContent) {
+  uneeq.postToFrame('updateDisplayContent', htmlContent);
+}
